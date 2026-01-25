@@ -2,8 +2,10 @@
 Momentum Transcription Service
 FastAPI + faster-whisper for voice-to-text transcription
 Deploy on Railway
+
+v2.0: Added API key auth for external services (Clawdbot)
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 import tempfile
@@ -12,7 +14,7 @@ import os
 app = FastAPI(
     title="Momentum Transcription Service",
     description="Voice-to-text transcription using faster-whisper",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # CORS - Allow Momentum domains
@@ -30,11 +32,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# API Key for external services (Clawdbot, etc.)
+# Set via TRANSCRIBE_API_KEY environment variable on Railway
+API_KEY = os.environ.get("TRANSCRIBE_API_KEY")
+
 # Load model on startup (cached in memory)
 # Using 'base' (multilingual) instead of 'base.en' (English-only)
 print("🎤 Loading Whisper model (base - multilingual)...")
 model = WhisperModel("base", device="cpu", compute_type="int8")
 print("✅ Model loaded and ready!")
+
+
+def verify_auth(authorization: str | None, origin: str | None) -> bool:
+    """
+    Verify request authentication.
+    
+    Allows:
+    1. API Key auth (Bearer <api_key>) - for Clawdbot
+    2. Requests from allowed CORS origins (browser requests from Momentum)
+    3. No auth if API_KEY not configured (backwards compat)
+    """
+    # If no API key configured, allow all (backwards compat)
+    if not API_KEY:
+        return True
+    
+    # Check API key auth
+    if authorization:
+        if authorization.startswith("Bearer "):
+            token = authorization[7:]
+            if token == API_KEY:
+                return True
+    
+    # Allow browser requests from Momentum domains (CORS handles this)
+    if origin and any(allowed in origin for allowed in [
+        "localhost",
+        "dailymomentum.io",
+        "vercel.app"
+    ]):
+        return True
+    
+    return False
 
 
 @app.get("/")
@@ -43,7 +80,8 @@ def root():
     return {
         "service": "Momentum Transcription",
         "status": "healthy",
-        "model": "base"
+        "model": "base",
+        "version": "2.0.0"
     }
 
 
@@ -54,16 +92,24 @@ def health_check():
         "status": "healthy",
         "model": "base",
         "device": "cpu",
-        "compute_type": "int8"
+        "compute_type": "int8",
+        "auth_required": bool(API_KEY)
     }
 
 
 @app.post("/transcribe")
-async def transcribe_audio(audio: UploadFile = File(...)):
+async def transcribe_audio(
+    request: Request,
+    audio: UploadFile = File(...),
+    authorization: str | None = Header(None),
+):
     """
     Transcribe audio file to text.
     
     Accepts: audio/webm, audio/wav, audio/mp3, audio/ogg, audio/mpeg
+    
+    Headers:
+        - Authorization: Bearer <api_key> (required for non-browser requests)
     
     Returns:
         {
@@ -73,6 +119,15 @@ async def transcribe_audio(audio: UploadFile = File(...)):
             "language": "en"
         }
     """
+    # Check authentication
+    origin = request.headers.get("origin")
+    
+    if not verify_auth(authorization, origin):
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Provide API key via Authorization: Bearer <key>"
+        )
+    
     # Validate content type
     content_type = audio.content_type or ""
     if not (content_type.startswith("audio/") or content_type == "application/octet-stream"):
@@ -131,7 +186,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
                 "text": "",
                 "segments": [],
                 "duration": info.duration if info else 0,
-                "language": "en",
+                "language": info.language if info else "unknown",
                 "message": "No speech detected in audio"
             }
         
@@ -139,7 +194,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
             "text": full_text,
             "segments": segment_list,
             "duration": round(info.duration, 2) if info else 0,
-            "language": info.language if info else "en"
+            "language": info.language if info else "unknown"
         }
         
     except Exception as e:
